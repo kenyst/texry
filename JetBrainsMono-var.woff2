@@ -1,0 +1,1041 @@
+/* Texry Mini App. Без сборки: чистый JS. Весь учёт (подписка, очки, энергия, промокоды) — на сервере. */
+(() => {
+  "use strict";
+
+  const tg = window.Telegram && window.Telegram.WebApp;
+  const qs = new URLSearchParams(location.search);
+  const DEV_ID = qs.get("dev");
+  const API = window.TEXRY_API || "";
+  const AUTH = tg && tg.initData ? "tma " + tg.initData : DEV_ID ? "dev " + DEV_ID : "";
+  const $app = document.getElementById("app");
+  const $toast = document.getElementById("toast");
+
+  // ---------- состояние ----------
+  const S = {
+    screen: "loading",
+    history: [],
+    me: null,
+    config: null,
+    plan: "m12",
+    devices: 1,
+    faqOpen: null,
+    ref: { range: "days", data: null, bar: null, copied: false, loading: false },
+    tap: null,
+    game: null,
+    gameSel: 0,
+    gameBusy: false,
+    key: null,
+    payment: null,
+    afterPhone: null,
+    copied: null,
+    error: null,
+  };
+
+  // ---------- утилиты ----------
+  const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const fmt = (n) => Number(n || 0).toLocaleString("ru-RU");
+  const plural = (n, one, few, many) => {
+    const a = Math.abs(n) % 100, b = a % 10;
+    if (a > 10 && a < 20) return many;
+    if (b > 1 && b < 5) return few;
+    if (b === 1) return one;
+    return many;
+  };
+  const dateRu = (iso) => (iso ? new Date(iso).toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit", year: "numeric" }) : "—");
+  const timeRu = (iso) => (iso ? new Date(iso).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }) : "");
+  const haptic = (type = "light") => {
+    try {
+      if (!tg || !tg.HapticFeedback) return;
+      if (type === "success" || type === "error" || type === "warning") tg.HapticFeedback.notificationOccurred(type);
+      else if (type === "select") tg.HapticFeedback.selectionChanged();
+      else tg.HapticFeedback.impactOccurred(type);
+    } catch (_) {}
+  };
+
+  let toastTimer = null;
+  function toast(text, isError = false) {
+    $toast.textContent = text;
+    $toast.classList.toggle("error", isError);
+    $toast.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => $toast.classList.remove("show"), 2600);
+  }
+
+  async function copy(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_) {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      let ok = false;
+      try { ok = document.execCommand("copy"); } catch (_) {}
+      ta.remove();
+      return ok;
+    }
+  }
+
+  function openLink(url) {
+    if (!url) return;
+    if (tg && tg.openLink) tg.openLink(url);
+    else window.open(url, "_blank", "noopener");
+  }
+  function openTg(url) {
+    if (tg && tg.openTelegramLink) tg.openTelegramLink(url);
+    else window.open(url, "_blank", "noopener");
+  }
+
+  class ApiError extends Error {
+    constructor(message, code, status) { super(message); this.code = code; this.status = status; }
+  }
+  async function api(path, body, method) {
+    const opts = { method: method || (body ? "POST" : "GET"), headers: { Authorization: AUTH } };
+    if (body) {
+      opts.headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(body);
+    }
+    let res;
+    try {
+      res = await fetch(API + path, opts);
+    } catch (_) {
+      throw new ApiError("Нет соединения. Проверьте интернет.", "network", 0);
+    }
+    let data = null;
+    try { data = await res.json(); } catch (_) {}
+    if (!res.ok) {
+      const d = (data && data.detail) || {};
+      throw new ApiError(d.message || "Что-то пошло не так. Попробуйте ещё раз.", d.error || "error", res.status);
+    }
+    return data;
+  }
+
+  // ---------- иконки (из макета) ----------
+  const I = {
+    close: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M3 3l10 10M13 3L3 13"/></svg>',
+    back: '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11.5 3.5L6 9l5.5 5.5"/></svg>',
+    chev: '<svg class="chev" width="16" height="16" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5L11.5 9L6 14.5"/></svg>',
+    game: '<svg width="22" height="22" viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><rect x="1.5" y="6" width="19" height="11" rx="5.5"/><path d="M6 9.5v3M4.5 11h3M14.5 10.5h.01M17 12.5h.01"/></svg>',
+    users: '<svg width="22" height="22" viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="7" r="3.2"/><path d="M2.5 18c0-3 2.5-5 5.5-5s5.5 2 5.5 5"/><circle cx="16.5" cy="8.5" r="2.4"/><path d="M15 13.2c2.8-.4 4.5 1.5 4.5 4.3"/></svg>',
+    plus: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10"/></svg>',
+    help: '<svg width="19" height="19" viewBox="0 0 19 19" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="9.5" cy="9.5" r="7.5"/><path d="M7.4 7.3a2.1 2.1 0 0 1 3.9.9c0 1.4-2 1.5-2 2.9"/><path d="M9.3 14h.01"/></svg>',
+    link: '<svg width="19" height="19" viewBox="0 0 19 19" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 11a3.5 3.5 0 0 0 5 0l2.5-2.5a3.5 3.5 0 0 0-5-5L9 5"/><path d="M11 8a3.5 3.5 0 0 0-5 0L3.5 10.5a3.5 3.5 0 0 0 5 5L10 14"/></svg>',
+    refresh: '<svg width="19" height="19" viewBox="0 0 19 19" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 4.5v4h-4M3 14.5v-4h4"/><path d="M15.2 8.2A6 6 0 0 0 4.6 6.4M3.8 10.8a6 6 0 0 0 10.6 1.8"/></svg>',
+    bolt: '<svg width="15" height="15" viewBox="0 0 15 15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.5L3.5 8.5h3.5L6.5 13.5L11.5 6.5H8z"/></svg>',
+    lock: '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="2"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg>',
+    lockLg: '<svg width="22" height="22" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="2"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg>',
+    phone: '<svg width="22" height="22" viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><rect x="6" y="2" width="10" height="18" rx="2.5"/><path d="M10 16.5h2"/></svg>',
+    check: '<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
+  };
+
+  // ---------- навигация ----------
+  const ROOT = "home";
+  function go(screen, opts = {}) {
+    if (screen === S.screen) return render();
+    if (!opts.replace && S.screen !== "loading" && S.screen !== "error") S.history.push(S.screen);
+    leaveScreen(S.screen);
+    S.screen = screen;
+    enterScreen(screen);
+    render(true);
+    haptic("select");
+  }
+  function back() {
+    leaveScreen(S.screen);
+    S.screen = S.history.pop() || ROOT;
+    enterScreen(S.screen);
+    render(true);
+  }
+  function syncBackButton() {
+    if (!tg || !tg.BackButton) return;
+    if (S.screen === ROOT || S.screen === "loading" || S.screen === "error") tg.BackButton.hide();
+    else tg.BackButton.show();
+  }
+
+  function enterScreen(screen) {
+    const locked = !S.me || S.me.locked;
+    if (screen === "ref" && !locked) loadRef();
+    if (screen === "abuse" && !locked) loadTap();
+    if (screen === "game" && !locked) loadGame();
+    if (screen === "key" && !locked) loadKey();
+    if (screen === "pay") startPayPolling();
+    if (tg && tg.disableVerticalSwipes && tg.enableVerticalSwipes) {
+      if (screen === "abuse" || screen === "game") tg.disableVerticalSwipes();
+      else tg.enableVerticalSwipes();
+    }
+  }
+  function leaveScreen(screen) {
+    if (screen === "abuse") flushTaps();
+    if (screen === "pay") stopPayPolling();
+  }
+
+  // ---------- данные ----------
+  async function loadMe() {
+    S.me = await api("/api/me");
+    if (S.me.subscription.active && S.me.subscription.devices) S.devices = S.me.subscription.devices;
+    if (S.me.tapper) S.tap = S.me.tapper;
+    return S.me;
+  }
+
+  async function boot() {
+    if (tg) {
+      try {
+        tg.ready();
+        tg.expand();
+        tg.setHeaderColor && tg.setHeaderColor("#212842");
+        tg.setBackgroundColor && tg.setBackgroundColor("#212842");
+        tg.setBottomBarColor && tg.setBottomBarColor("#212842");
+        tg.BackButton && tg.BackButton.onClick(back);
+      } catch (_) {}
+    }
+    if (!AUTH) {
+      S.screen = "error";
+      S.error = { title: "Откройте приложение из Telegram", text: "Мини-приложение работает только внутри Telegram-бота." };
+      return render();
+    }
+    try {
+      const [config] = await Promise.all([api("/api/config"), loadMe()]);
+      S.config = config;
+      S.screen = ROOT;
+      const sp = tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param;
+      render();
+      if (S.me.pending_payment && S.me.pending_payment.status !== "paid") S.payment = S.me.pending_payment;
+      if (sp === "pay" && S.payment) go("pay");
+    } catch (e) {
+      S.screen = "error";
+      S.error = e.status === 403
+        ? { title: "Доступ ограничен", text: e.message }
+        : { title: "Не удалось загрузить", text: e.message, retry: true };
+      render();
+    }
+  }
+
+  document.addEventListener("visibilitychange", async () => {
+    if (document.visibilityState === "hidden") return flushTaps();
+    if (S.me && S.screen !== "loading" && S.screen !== "error") {
+      try { await loadMe(); render(); } catch (_) {}
+    }
+  });
+
+  // ---------- общие куски разметки ----------
+  const topBack = (extra = "") =>
+    `<header class="topbar"><button class="back-btn" data-act="back">${I.back}<span>Назад</span></button><div class="spacer"></div>${extra}</header>`;
+
+  const avatar = (u, lg) => {
+    const cls = "avatar" + (lg ? " lg" : "");
+    if (u.photo_url && /^https:\/\//.test(u.photo_url)) return `<span class="${cls}"><img src="${esc(u.photo_url)}" alt="" referrerpolicy="no-referrer" onerror="this.remove()"></span>`;
+    return `<span class="${cls}" aria-hidden="true">${esc(u.initials)}</span>`;
+  };
+
+  const lockCard = (title, text, cta = "Оформить подписку") => `
+    <section class="lock-card" aria-label="${esc(title)}">
+      <div class="lock-icon">${I.lockLg}</div>
+      <h2>${esc(title)}</h2>
+      <p>${esc(text)}</p>
+      <button class="btn" data-act="buy">${esc(cta)}</button>
+    </section>`;
+
+  const sub = () => (S.me ? S.me.subscription : { active: false });
+  const locked = () => !S.me || S.me.locked;
+  const planById = (id) => (S.config ? S.config.plans.find((p) => p.id === id) : null);
+  const devicesMonthly = (n) => {
+    const prices = (S.config && S.config.device_prices) || [199, 149, 119, 119, 119, 89, 89, 89, 89, 89];
+    let s = 0;
+    for (let i = 0; i < n; i++) s += prices[i];
+    return s;
+  };
+  const planAmount = (plan, n) => Math.round((plan.price * devicesMonthly(n)) / devicesMonthly(1));
+
+  // ---------- экраны ----------
+  const screens = {};
+
+  screens.loading = () => `<div class="center-state"><div class="loader" role="img" aria-label="Загрузка"></div></div>`;
+
+  screens.error = () => `
+    <div class="screen"><div class="center-state">
+      <div class="lock-icon">${I.lockLg}</div>
+      <h1>${esc(S.error.title)}</h1><p>${esc(S.error.text)}</p>
+      ${S.error.retry ? '<button class="btn" data-act="retry">Повторить</button>' : ""}
+    </div></div>`;
+
+  screens.home = () => {
+    const u = S.me.user;
+    const st = sub();
+    const pct = st.active && st.gb_total ? Math.max(0, Math.min(1, st.gb_left / st.gb_total)) : 0;
+    const offset = 603 - 603 * pct;
+    const lockBadge = `<span class="badge lock">${I.lock}<span>PRO</span></span>`;
+    const pending = S.me.pending_payment;
+    const cfg = S.config;
+    return `
+    <div class="screen">
+      <header class="topbar center">
+        <button class="icon-btn" data-act="close" aria-label="Закрыть приложение">${I.close}</button>
+        <button class="profile-chip" data-act="go" data-arg="sub" aria-label="Профиль и подписка">
+          ${avatar(u)}
+          <span class="who"><span class="name">${esc(u.first_name || "Профиль")}</span>${u.username ? `<span class="handle">@${esc(u.username)}</span>` : ""}</span>
+        </button>
+        <div style="width:44px;margin-right:-10px" aria-hidden="true"></div>
+      </header>
+      <div class="scroll">
+        <div class="hero-head">
+          <span class="eyebrow">Безопасный интернет</span>
+          <span class="state-label ${st.active ? "" : "off"}">${st.active ? (S.me.vpn_enabled ? "Защита включена" : "Подписка активна") : st.expired ? "Подписка закончилась" : "Защита выключена"}</span>
+        </div>
+        <div class="ring" role="img" aria-label="Баланс ${fmt(st.gb_left)} ГБ, осталось ${st.days_left} ${plural(st.days_left, "день", "дня", "дней")}">
+          ${st.active ? '<div class="pulse"></div>' : ""}
+          <svg width="196" height="196" viewBox="0 0 216 216" aria-hidden="true">
+            <circle cx="108" cy="108" r="96" fill="none" stroke="rgba(240,231,213,.1)" stroke-width="8"/>
+            <circle class="progress" cx="108" cy="108" r="96" fill="none" stroke="#F0E7D5" stroke-width="8" stroke-linecap="round" stroke-dasharray="603" stroke-dashoffset="${offset}" ${pct === 0 ? 'stroke-opacity="0"' : ""}/>
+          </svg>
+          <div class="ring-center" aria-hidden="true">
+            <span class="stat-label">Баланс</span>
+            <div class="ring-value"><span class="num">${fmt(st.gb_left)}</span><span class="unit">ГБ</span></div>
+            <span class="ring-sub">осталось · ${st.days_left} ${plural(st.days_left, "день", "дня", "дней")}</span>
+          </div>
+        </div>
+        <button class="btn hero-btn" data-act="${st.active ? "go" : "buy"}" data-arg="key">${st.active ? "Подключить" : "Оформить подписку"}</button>
+
+        ${pending ? `<button class="pending-strip" data-act="go" data-arg="pay"><span class="dot live" aria-hidden="true"></span><span style="flex:1">Ожидаем оплату · <span class="mono">${esc(pending.code)}</span></span><span class="mono">${fmt(pending.amount)} ₽</span>${I.chev}</button>` : ""}
+
+        <div class="grid-2">
+          <button class="tile" data-act="go" data-arg="game">
+            ${I.game}${locked() ? lockBadge : ""}
+            <span class="t-text"><span class="t-title">Игры — ${esc(cfg.brand)}</span><span class="t-sub">Промокоды за победы</span></span>
+          </button>
+          <button class="tile" data-act="go" data-arg="ref">
+            ${I.users}${locked() ? lockBadge : ""}
+            <span class="t-text"><span class="t-title">Рефералы</span><span class="t-sub">+${cfg.ref_bonus_gb} ГБ за друга</span></span>
+          </button>
+        </div>
+
+        <button class="offer" data-act="go" data-arg="abuse">
+          <span class="o-text"><span class="eyebrow-mono">Спец предложение</span><span class="o-title">${esc(cfg.brand.toUpperCase())} ABUSE</span></span>
+          ${locked() ? `<span class="badge lock">${I.lock}<span>PRO</span></span>` : ""}
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5L11.5 9L6 14.5"/></svg>
+        </button>
+
+        <section class="profile-card">
+          <button class="p-head" data-act="go" data-arg="sub">
+            ${avatar(u, true)}
+            <span class="p-text">
+              <span class="p-title">Профиль и подписка</span>
+              <span class="p-sub">${st.active ? `${esc(S.me.plan_title || "")} · до ${dateRu(st.expires_at)} · ${st.devices} ${plural(st.devices, "устройство", "устройства", "устройств")}` : "основная ссылка · появится после оплаты"}</span>
+            </span>
+            ${I.chev}
+          </button>
+          <button class="btn" data-act="buy">${I.plus}${st.active ? "Пополнить основную ссылку" : "Оформить подписку"}</button>
+        </section>
+
+        <button class="row" data-act="go" data-arg="faq">${I.help}<span class="r-text"><span class="r-title">FAQ — частые вопросы</span></span>${I.chev}</button>
+        <div class="footer-note">Telegram Mini App · v1.0</div>
+      </div>
+    </div>`;
+  };
+
+  // --- Подключение / ключ ---
+  screens.key = () => {
+    const st = sub();
+    if (!st.active) {
+      return `<div class="screen">${topBack()}<div class="scroll gap-14">
+        <div class="head-block"><span class="eyebrow">Подключение</span><p class="lead">Ключ доступа привязывается к вашему Telegram-аккаунту и выдаётся после оплаты.</p></div>
+        <section class="card cream">
+          <div class="kv" style="border:0"><span class="eyebrow-mono">Твой активный ключ</span><span class="pill-dark">0 ДНЕЙ</span></div>
+          <span class="key-text placeholder">Нет активной подписки</span>
+        </section>
+        ${lockCard("Ключ появится после оплаты", "Оформите подписку — ключ, одноразовая ссылка и управление устройствами станут доступны сразу.")}
+        <section class="card"><div class="kv"><span class="r-title" style="font-size:14px;font-weight:700">Подключённые устройства</span><span class="v mono" style="color:var(--fg-subtle)">0/0</span></div></section>
+      </div></div>`;
+    }
+    const k = S.key;
+    const plan = planById(st.plan_id);
+    const ready = k && k.ready;
+    return `<div class="screen">${topBack()}<div class="scroll gap-14">
+      <div class="head-block"><span class="eyebrow">Подключение</span><p class="lead">Ключ привязан к вашему Telegram-аккаунту. Не передавайте его другим — лишние устройства отключаются.</p></div>
+      <section class="card cream" aria-label="Ключ доступа">
+        <div class="kv" style="border:0;padding:0"><span class="eyebrow-mono">Твой активный ключ</span><span class="pill-dark">${plan ? plan.months + " МЕС" : "АКТИВЕН"}</span></div>
+        ${ready ? `<span class="key-text">${esc(k.key || k.sub_url)}</span>` : `<span class="key-text placeholder">Ключ появится после запуска серверов</span><span class="muted" style="font-size:12px;font-weight:600">Подписка уже активна и привязана к аккаунту — мы пришлём ключ в бот.</span>`}
+        <div class="kv" style="border:0;padding:0">
+          <span class="muted" style="font-size:11px;font-weight:600">Подписка до ${dateRu(st.expires_at)}</span>
+          <button class="btn dark sm" data-act="copy-key" ${ready ? "" : "disabled"}>${S.copied === "key" ? "Скопировано" : "Копировать"}</button>
+        </div>
+      </section>
+      <button class="row dashed" data-act="soon" ${ready ? "" : "disabled"}>${I.link}<span class="r-text"><span class="r-title">Одноразовая ссылка</span><span class="r-sub">${ready ? "для подключения нового устройства" : "станет доступна вместе с ключом"}</span></span>${I.chev}</button>
+      <button class="row" data-act="reissue" ${ready ? "" : "disabled"}>${I.refresh}<span class="r-text"><span class="r-title">Перевыпуск ключа</span><span class="r-sub">Старый ключ перестанет работать</span></span></button>
+      <section class="card">
+        <div class="kv"><span style="font-size:14px;font-weight:700">Подключённые устройства</span><span class="v" style="color:var(--fg-subtle)">${k ? k.devices.length : 0}/${st.devices}</span></div>
+        ${k && k.devices.length ? k.devices.map((d) => `<div class="invite"><span class="dot" aria-hidden="true" style="width:6px;height:6px;${d.online ? "" : "opacity:.35"}"></span><span class="n" style="font-family:var(--font);font-weight:600;font-size:13px">${esc(d.name)}</span><span class="w">${esc(d.status || "")}</span></div>`).join("") : `<div class="empty">Пока нет подключённых устройств</div>`}
+      </section>
+      <button class="row" data-act="go" data-arg="plans"><span class="r-text"><span class="r-title">Смена тарифа</span><span class="r-sub">Сейчас: ${esc(S.me.plan_title || "")} · ${st.devices} ${plural(st.devices, "устройство", "устройства", "устройств")}</span></span>${I.chev}</button>
+    </div></div>`;
+  };
+
+  // --- Смена тарифа (устройства) ---
+  function plansNumbers() {
+    const n = S.devices;
+    const prices = [];
+    let sum = 0;
+    for (let i = 1; i <= n; i++) {
+      const p = devicesMonthly(i) - devicesMonthly(i - 1);
+      prices.push(p);
+      sum += p;
+    }
+    const st = sub();
+    let cta, action;
+    if (st.active && n > st.devices) {
+      const days = Math.max(0, (new Date(st.expires_at) - Date.now()) / 864e5);
+      const diff = Math.max(10, Math.ceil(((devicesMonthly(n) - devicesMonthly(st.devices)) * days) / 30));
+      cta = `Доплатить ${fmt(diff)} ₽ за ${n} устр.`;
+      action = "pay-devices";
+    } else if (st.active && n === st.devices) {
+      cta = "Это ваш текущий тариф";
+      action = "";
+    } else if (st.active) {
+      cta = `Перейти на ${n} устр. при продлении`;
+      action = "devices-to-sub";
+    } else {
+      cta = `Перейти на ${n} устр. — ${fmt(sum)} ₽`;
+      action = "devices-to-sub";
+    }
+    return { n, prices, sum, cta, action };
+  }
+
+  screens.plans = () => {
+    const max = (S.config && S.config.device_prices.length) || 10;
+    const x = plansNumbers();
+    return `<div class="screen">${topBack()}<div class="scroll gap-18">
+      <div class="head-block"><span class="eyebrow">Смена тарифа</span><p class="lead">Выбери количество устройств — цена меняется пропорционально.</p></div>
+      <section class="card" style="gap:16px;padding:20px 18px">
+        <div class="stat-row">
+          <div class="stat-col"><span class="stat-label">Устройств</span><span class="stat-big" id="devCount">${x.n}</span></div>
+          <div class="stat-col right"><span class="stat-label">В месяц</span><div class="amount"><span class="stat-big" id="devSum">${fmt(x.sum)}</span><span class="unit">₽</span></div></div>
+        </div>
+        <div class="range-wrap">
+          <button class="step-btn" data-act="dev-step" data-arg="-1" aria-label="Меньше устройств" ${x.n <= 1 ? "disabled" : ""}>−</button>
+          <input id="devRange" type="range" min="1" max="${max}" step="1" value="${x.n}" aria-label="Количество устройств">
+          <button class="step-btn" data-act="dev-step" data-arg="1" aria-label="Больше устройств" ${x.n >= max ? "disabled" : ""}>+</button>
+        </div>
+        <div class="scale" aria-hidden="true"><span>1</span><span>5</span><span>${max}</span></div>
+        <div class="kv" style="padding-top:12px;border-top:1px solid var(--line)"><span class="k">Цена за устройство</span><span class="v" id="devPer">${fmt(Math.round(x.sum / x.n))} ₽</span></div>
+      </section>
+      <div class="head-block" style="gap:8px">
+        <span class="stat-label">Как считается</span>
+        <ul class="list" id="tiers">${tiersHtml(x)}</ul>
+      </div>
+      <button class="btn" id="devCta" data-act="${x.action}" ${x.action ? "" : "disabled"}>${esc(x.cta)}</button>
+    </div></div>`;
+  };
+  const tiersHtml = (x) =>
+    x.prices.map((p, i) => `<li class="tier ${i === 0 ? "first" : ""}"><span class="tl">${i + 1}-е устройство</span><span class="tp">${fmt(p)} ₽</span></li>`).join("") +
+    `<li class="tier total"><span class="tl">Итого · ${x.n} устр.</span><span class="tp">${fmt(x.sum)} ₽</span></li>`;
+
+  function updatePlansDom() {
+    const x = plansNumbers();
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    set("devCount", x.n);
+    set("devSum", fmt(x.sum));
+    set("devPer", fmt(Math.round(x.sum / x.n)) + " ₽");
+    const t = document.getElementById("tiers");
+    if (t) t.innerHTML = tiersHtml(x);
+    const cta = document.getElementById("devCta");
+    if (cta) {
+      cta.textContent = x.cta;
+      cta.dataset.act = x.action;
+      cta.disabled = !x.action;
+    }
+    const max = (S.config && S.config.device_prices.length) || 10;
+    document.querySelectorAll('[data-act="dev-step"]').forEach((b) => { b.disabled = b.dataset.arg === "-1" ? x.n <= 1 : x.n >= max; });
+  }
+
+  // --- Подписка ---
+  screens.sub = () => {
+    const st = sub();
+    const plans = S.config.plans;
+    const cur = planById(S.plan) || plans[plans.length - 1];
+    const n = S.devices;
+    const amount = planAmount(cur, n);
+    const baseTotal = Math.round((S.config.base_month_price * devicesMonthly(n)) / devicesMonthly(1)) * cur.months;
+    const save = baseTotal - amount;
+    const u = S.me.user;
+    return `<div class="screen">${topBack()}<div class="scroll gap-14">
+      <div class="head-block"><span class="eyebrow">Профиль и подписка</span><p class="lead">Чем дольше период — тем ниже цена за месяц. Списание один раз, без автоплатежей.</p></div>
+      <section class="card" style="flex-direction:row;align-items:center;gap:12px">
+        ${avatar(u, true)}
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px">
+          <span style="font-size:14px;font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc([u.first_name, u.last_name].filter(Boolean).join(" "))}</span>
+          <span class="mono" style="font-size:11px;color:var(--fg-subtle)">${st.active ? `активна до ${dateRu(st.expires_at)}` : st.expired ? "подписка закончилась" : "нет подписки"} · ${u.phone_verified ? `тел. ••${esc(u.phone_tail)}` : "номер не привязан"}</span>
+        </div>
+      </section>
+      <div role="radiogroup" aria-label="Период подписки" style="display:flex;flex-direction:column;gap:10px">
+        ${plans.map((p) => {
+          const a = planAmount(p, n);
+          return `<button class="plan" role="radio" aria-checked="${p.id === cur.id}" data-act="plan" data-arg="${p.id}">
+            <span class="radio" aria-hidden="true"></span>
+            <span class="p-mid"><span class="p-title">${esc(p.title)}</span><span class="p-note">${esc(p.note)}</span></span>
+            <span class="p-right"><span class="p-price">${fmt(Math.round(a / p.months))} ₽/мес</span><span class="p-total">${p.months === 1 ? "разово " + fmt(a) + " ₽" : fmt(a) + " ₽ за " + p.months + " мес"}</span></span>
+            ${p.badge ? `<span class="p-badge">${esc(p.badge)}</span>` : ""}
+          </button>`;
+        }).join("")}
+      </div>
+      <section class="card" style="gap:8px;padding:14px 18px">
+        <div class="kv"><span class="k">Устройств</span><button class="v" data-act="go" data-arg="plans" style="min-height:32px;text-decoration:underline;text-underline-offset:3px">${n} · изменить</button></div>
+        <div class="kv"><span class="k">Экономия против месячного</span><span class="v">${cur.months === 1 ? "—" : `${fmt(save)} ₽ (${Math.round((save / baseTotal) * 100)}%)`}</span></div>
+        <div class="kv"><span class="k">Бонус к подписке</span><span class="v">${esc(cur.bonus_label)}</span></div>
+        <div class="kv"><span class="k">Трафик</span><span class="v">${fmt(cur.months * S.config.gb_per_month + cur.bonus_gb)} ГБ</span></div>
+      </section>
+      <button class="btn" data-act="pay-sub">${st.active ? "Продлить" : "Оформить"} · ${fmt(amount)} ₽</button>
+      <p class="fine">Оплата через DonationAlerts по коду платежа. ${st.active ? "Срок добавится к текущей подписке." : "Подписка привязывается к вашему Telegram-аккаунту."}</p>
+    </div></div>`;
+  };
+
+  // --- Привязка телефона ---
+  screens.phone = () => `<div class="screen">${topBack()}<div class="scroll gap-14">
+      <div class="head-block"><span class="eyebrow">Привязка аккаунта</span><p class="lead">Перед первой оплатой подтвердите номер телефона. Так мы защищаем акции, промокоды и реферальные бонусы от накруток.</p></div>
+      <section class="card cream" style="gap:14px">
+        <div style="display:flex;align-items:center;gap:12px"><span class="lock-icon" style="background:rgba(33,40,66,.1);color:var(--ink)">${I.phone}</span><span style="font-size:15px;font-weight:800">Один номер — один аккаунт</span></div>
+        <ul class="steps">
+          <li>Нужно сделать один раз</li>
+          <li>Номер хранится в виде хеша — мы не видим его целиком</li>
+          <li>Виртуальные номера не принимаются</li>
+        </ul>
+      </section>
+      <button class="btn" data-act="request-phone">Поделиться номером</button>
+      <button class="btn ghost" data-act="phone-bot">Отправить номер через бота</button>
+    </div></div>`;
+
+  // --- Оплата ---
+  screens.pay = () => {
+    const p = S.payment;
+    if (!p) return `<div class="screen">${topBack()}<div class="center-state"><h1>Нет активного платежа</h1><button class="btn" data-act="go" data-arg="sub">Выбрать тариф</button></div></div>`;
+    const what = p.kind === "subscription"
+      ? `Подписка · ${esc((planById(p.plan_id) || {}).title || "")} · ${p.devices} устр.`
+      : p.kind === "devices" ? `Доплата за ${p.devices} устр.` : `x2 энергия · ${S.config.x2_taps} тапов`;
+    if (p.status === "paid") {
+      const st = sub();
+      return `<div class="screen">${topBack()}<div class="scroll gap-14">
+        <div class="success"><div class="check">${I.check}</div><h2>Оплата получена</h2>
+        <p>${p.kind === "subscription" || p.kind === "devices" ? `Подписка активна до ${dateRu(st.expires_at)}` : "x2 энергия активирована"}</p></div>
+        <section class="card"><div class="kv"><span class="k">${what}</span><span class="v">${fmt(p.amount)} ₽</span></div><div class="kv"><span class="k">Код</span><span class="v">${esc(p.code)}</span></div></section>
+        <button class="btn" data-act="home">На главную</button>
+      </div></div>`;
+    }
+    if (p.status === "expired" || p.status === "cancelled") {
+      return `<div class="screen">${topBack()}<div class="center-state">
+        <h1>${p.status === "expired" ? "Время кода истекло" : "Платёж отменён"}</h1>
+        <p>Если вы уже отправили донат с кодом ${esc(p.code)} — он всё равно будет засчитан в течение суток. Иначе создайте новый платёж.</p>
+        <button class="btn" data-act="go" data-arg="sub">Создать новый</button>
+      </div></div>`;
+    }
+    const under = p.status === "underpaid";
+    return `<div class="screen">${topBack()}<div class="scroll gap-14">
+      <div class="head-block"><span class="eyebrow">Оплата</span><p class="lead">Отправьте донат через DonationAlerts и вставьте код в сообщение — так мы поймём, что платёж ваш.</p></div>
+      <section class="card">
+        <span class="stat-label">К оплате</span>
+        <div class="amount"><span class="num">${fmt(p.amount)}</span><span class="unit">₽</span></div>
+        <span class="lead" style="font-size:12px">${what}</span>
+      </section>
+      <section class="card cream">
+        <span class="eyebrow-mono">Код платежа</span>
+        <div class="kv" style="border:0;padding:0"><span class="code-big">${esc(p.code)}</span><button class="btn dark sm" data-act="copy-code">${S.copied === "code" ? "Скопировано" : "Копировать"}</button></div>
+      </section>
+      <ol class="steps">
+        <li><span>Нажмите <b>«Перейти к оплате»</b> — код скопируется сам</span></li>
+        <li><span>Укажите сумму <b>не меньше ${fmt(p.amount)} ₽</b></span></li>
+        <li><span>В сообщение к донату вставьте код <b class="mono">${esc(p.code)}</b></span></li>
+      </ol>
+      <div class="card" style="padding:14px 16px">
+        <div class="status-line"><span class="dot live" aria-hidden="true"></span><span>${under ? "Получена часть оплаты" : "Ожидаем платёж"}</span><span class="muted">код до ${timeRu(p.expires_at)}</span></div>
+        ${under ? `<span class="lead" style="font-size:12px">Доплатите разницу донатом с тем же кодом или напишите в поддержку.</span>` : ""}
+      </div>
+      <button class="btn" data-act="open-pay" ${p.pay_url ? "" : "disabled"}>${p.pay_url ? "Перейти к оплате" : "Оплата временно недоступна"}</button>
+      <button class="btn text" data-act="cancel-pay">Отменить платёж</button>
+      <p class="fine">Проверка занимает до минуты после доната. Этот экран обновится сам.</p>
+    </div></div>`;
+  };
+
+  // --- Рефералы ---
+  screens.ref = () => {
+    const isLocked = locked();
+    const d = S.ref.data;
+    const tabs = [["days", "Дни"], ["months", "Месяцы"], ["years", "Годы"]];
+    const chart = d ? d.chart : ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"].map((l) => ({ label: l, value: 0 }));
+    const max = Math.max(1, ...chart.map((c) => c.value));
+    const sum = chart.reduce((a, c) => a + c.value, 0);
+    const statusText = { credited: (r) => `+${r.gb} ГБ`, joined: () => "ждёт оплаты", hold: () => "проверка", rejected: () => "не засчитан" };
+    const when = (iso) => {
+      const diff = (Date.now() - new Date(iso)) / 1000;
+      if (diff < 3600) return "только что";
+      if (diff < 86400) return `${Math.floor(diff / 3600)} ч назад`;
+      if (diff < 172800) return "вчера";
+      const days = Math.floor(diff / 86400);
+      return `${days} ${plural(days, "день", "дня", "дней")} назад`;
+    };
+    return `<div class="screen">${topBack()}<div class="scroll gap-14">
+      <div class="stat-row">
+        <div class="stat-col"><span class="stat-label">Рефералов</span><span class="stat-big" style="font-size:40px">${fmt(d ? d.total : 0)}</span></div>
+        <div class="stat-col right"><span class="stat-label">Начислено</span><span class="mono" style="font-size:20px;font-weight:500">${fmt(d ? d.credited_gb : 0)} ГБ</span></div>
+      </div>
+      <div class="tabs" role="tablist" aria-label="Период">
+        ${tabs.map(([k, l]) => `<button class="tab" role="tab" aria-selected="${S.ref.range === k}" data-act="ref-range" data-arg="${k}" ${isLocked ? "disabled" : ""}>${l}</button>`).join("")}
+      </div>
+      <section class="card" style="padding:16px 16px 12px">
+        <div class="kv" style="border:0;padding:0"><span class="k" style="color:var(--fg-subtle)">${esc(d ? d.caption : "За 7 дней")}</span><span class="v">+${sum} реф.</span></div>
+        <div class="chart">
+          ${chart.map((c, i) => `<button class="bar" aria-pressed="${S.ref.bar === i}" data-act="ref-bar" data-arg="${i}" aria-label="${esc(c.label)}: ${c.value}" ${isLocked ? "disabled" : ""}>
+            <span class="bv">${c.value}</span><span class="bb" style="height:${Math.max(8, (c.value / max) * 96)}px"></span><span class="bl">${esc(c.label)}</span></button>`).join("")}
+        </div>
+      </section>
+      ${isLocked
+        ? lockCard("Реферальная ссылка — с подпиской", `Оформите подписку, чтобы получить личную ссылку и +${S.config.ref_bonus_gb} ГБ за каждого друга после его первой оплаты.`)
+        : `<section class="card cream" style="gap:10px">
+            <span class="eyebrow-mono">Твоя ссылка</span>
+            <span class="link-text">${esc((d && d.link) || S.me.ref_link || "").replace("https://", "")}</span>
+            <div class="btn-pair"><button class="btn dark sm" data-act="copy-ref">${S.ref.copied ? "Скопировано" : "Копировать"}</button><button class="btn outline-dark sm" data-act="share-ref">Поделиться</button></div>
+          </section>
+          <section class="card" style="gap:8px">
+            <span style="font-size:13px;font-weight:700">Последние приглашения</span>
+            ${d && d.recent.length ? d.recent.map((r) => `<div class="invite"><span class="n">${esc(r.name)}</span><span class="w">${when(r.created_at)}</span><span class="g">${(statusText[r.status] || statusText.joined)(r)}</span></div>`).join("") : `<div class="empty">${S.ref.loading ? "Загрузка…" : "Пока никого — поделитесь ссылкой"}</div>`}
+          </section>
+          <p class="fine">Бонус приходит после первой оплаты друга. Самоприглашения, общий номер телефона и накрутки не засчитываются.</p>`}
+    </div></div>`;
+  };
+
+  // --- Игра ---
+  function canPlace(board, piece, r, c) {
+    return piece.every(([dr, dc]) => {
+      const rr = r + dr, cc = c + dc;
+      return rr >= 0 && rr < 8 && cc >= 0 && cc < 8 && !board[rr * 8 + cc];
+    });
+  }
+
+  screens.game = () => {
+    const isLocked = locked();
+    const g = S.game;
+    const goal = S.config.game_goal;
+    const score = g ? g.score : 0;
+    const t = g ? g.tier : 0;
+    const tierLabel = t === 0 ? "разогрев" : t === 1 ? "жёсткий режим" : "адский режим";
+    const hint = t === 0 ? "выбери фигуру и тапни поле" : t === 1 ? "+1 мусорный блок за ход" : "+3 мусорных блока за ход";
+    const board = g ? g.board : Array(64).fill(false);
+    const piece = g && !g.used[S.gameSel] ? g.tray[S.gameSel] : null;
+    const cells = board.map((filled, i) => {
+      const r = Math.floor(i / 8), c = i % 8;
+      const can = !isLocked && g && !g.over && piece && !filled && canPlace(board, piece, r, c);
+      return `<button class="cell ${filled ? "fill" : can ? "can" : ""}" data-act="cell" data-arg="${i}" aria-label="Клетка ${r + 1}-${c + 1}${filled ? ", занята" : ""}" ${isLocked || !g || g.over || S.gameBusy ? "disabled" : ""}></button>`;
+    }).join("");
+    const won = g && g.rewarded;
+    const exhausted = g && !g.rewarded && g.rewards_left === 0;
+    let overlay = "";
+    if (isLocked) {
+      overlay = `<div class="overlay"><div class="lock-icon">${I.lockLg}</div><h2>Игры доступны с подпиской</h2><p>${fmt(goal)} очков — ${S.config.game_reward_months} месяца подписки бесплатно. Одна награда на аккаунт.</p><button class="btn sm" data-act="buy">Оформить подписку</button></div>`;
+    } else if (g && g.over) {
+      overlay = `<div class="overlay"><h2>${won ? "Промокод твой" : "Ходов больше нет"}</h2><p>${won ? `${S.config.game_reward_months} месяца бесплатно начислены в подписку.` : `Собрано ${fmt(score)} из ${fmt(goal)}.`}</p><button class="btn sm" data-act="game-reset">Ещё попытка</button></div>`;
+    } else if (!g) {
+      overlay = `<div class="overlay" style="background:rgba(33,40,66,.6)"><div class="loader" role="img" aria-label="Загрузка"></div></div>`;
+    }
+    const tray = (g ? g.tray : [[], [], []]).map((p, i) => {
+      // центрируем фигуру в сетке 5×5
+      const h = p.length ? Math.max(...p.map(([r]) => r)) + 1 : 0;
+      const w = p.length ? Math.max(...p.map(([, c]) => c)) + 1 : 0;
+      const dr = Math.floor((5 - h) / 2), dc = Math.floor((5 - w) / 2);
+      const set = new Set(p.map(([r, c]) => (r + dr) * 5 + (c + dc)));
+      const used = !g || g.used[i];
+      return `<button class="piece" aria-pressed="${!used && i === S.gameSel}" data-act="piece" data-arg="${i}" aria-label="Фигура ${i + 1}" ${used || isLocked ? "disabled" : ""}>
+        <span class="pg" aria-hidden="true">${Array.from({ length: 25 }, (_, k) => `<span class="pc ${set.has(k) ? "on" : ""}"></span>`).join("")}</span></button>`;
+    }).join("");
+    return `<div class="screen">${topBack(isLocked ? "" : `<button class="chip-btn" data-act="game-reset">Заново</button>`)}
+      <div class="scroll" style="padding-top:6px">
+        <div class="stat-row">
+          <div class="stat-col"><span class="stat-label">Очки</span><span class="stat-big" style="font-size:32px">${fmt(score)}</span></div>
+          <div class="stat-col right"><span class="stat-label">${tierLabel}</span><span class="mono" style="font-size:12px;color:var(--fg-muted)">цель ${fmt(goal)}</span></div>
+        </div>
+        <div class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="${goal}" aria-valuenow="${score}"><i style="width:${Math.min(100, (score / goal) * 100)}%"></i></div>
+        <div class="board">${cells}${overlay}</div>
+        <div class="kv" style="border:0;padding:0"><span class="stat-label">Фигуры</span><span style="font-size:11px;font-weight:500;color:var(--fg-subtle)">${hint}</span></div>
+        <div class="tray">${tray}</div>
+        <div class="promo-card ${won ? "won" : ""}">
+          <span class="pt">${won ? `Промокод: ${S.config.game_reward_months} месяца бесплатно` : exhausted ? "Награда уже получена на этом аккаунте" : `${fmt(goal)} очков — ${S.config.game_reward_months} месяца бесплатно`}</span>
+          <span class="pn">${won ? "Уже применён к вашей подписке." : exhausted ? "Играть можно дальше — рекорд сохраняется. Лучший результат: " + fmt(g.best) : "После 100 000 поле начинает засоряться, после 300 000 фигуры становятся крупными. Ходы проверяются сервером."}</span>
+        </div>
+      </div></div>`;
+  };
+
+  // --- Texry Abuse ---
+  const pending = { taps: 0, inflight: 0, timer: null };
+
+  screens.abuse = () => {
+    const isLocked = locked();
+    const t = S.tap || { score: 0, energy: 0, energy_max: S.config ? 5000 : 0, x2_left: 0, per_tap: 1, promos: 0, goal: S.config.tap_goal_mb, can_claim: false, to_promo: S.config.tap_goal_mb };
+    const x2on = t.x2_left > 0;
+    return `<div class="screen">${topBack()}
+      <div class="scroll abuse" style="padding-top:8px">
+        <span class="eyebrow-mono" style="color:var(--fg-subtle)">${esc(S.config.brand)} Abuse</span>
+        <div class="tap-score"><span class="num" id="tapScore">${fmt(t.score)}</span><span style="font-size:14px;font-weight:700;color:var(--fg-muted)">МБ</span></div>
+        <button class="tap-circle" id="tapBtn" aria-label="Тапнуть" ${isLocked || t.energy <= 0 ? "disabled" : ""}>
+          <span class="plus" id="tapPlus">+${x2on ? 2 : 1}</span><span class="hint">${isLocked ? "с подпиской" : !S.tap ? "загрузка" : t.energy <= 0 ? "энергия закончилась" : "тапай"}</span>
+        </button>
+        <div class="energy">
+          <div class="kv" style="border:0;padding:0"><span class="stat-label">Энергия</span><span class="mono" style="font-size:12px" id="tapEnergy">${fmt(t.energy)}/${fmt(t.energy_max)}</span></div>
+          <div class="bar-track"><i id="tapEnergyBar" style="width:${t.energy_max ? (t.energy / t.energy_max) * 100 : 0}%"></i></div>
+        </div>
+        ${isLocked
+          ? lockCard("Тапалка доступна с подпиской", `Копите МБ: каждые ${S.config.tap_goal_mb} МБ превращаются в промокод на трафик. Энергия обновляется каждые сутки.`)
+          : `<button class="btn ghost x2 ${x2on ? "on" : ""}" data-act="${x2on ? "" : "buy-x2"}" id="x2Btn">${I.bolt}<span id="x2Label">${x2on ? `x2 активен · ${fmt(t.x2_left)} тапов` : `Купить x2 энергию · ${S.config.x2_price} ₽`}</span></button>
+            <div class="grid-2" style="width:100%">
+              <div class="mini-stat"><span class="k">До промокода</span><span class="v" id="tapToPromo">${fmt(Math.max(0, t.goal - t.score))} МБ</span></div>
+              <div class="mini-stat"><span class="k">Промокодов</span><span class="v">${fmt(t.promos)}</span></div>
+            </div>
+            <button class="btn wide" id="claimBtn" data-act="claim" ${t.score >= t.goal ? "" : "disabled"}>${t.score >= t.goal ? "Забрать промокод" : `Накопи ${fmt(t.goal)} МБ`}</button>`}
+      </div></div>`;
+  };
+
+  function updateTapDom() {
+    const t = S.tap;
+    if (!t || S.screen !== "abuse") return;
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    set("tapScore", fmt(t.score));
+    set("tapEnergy", `${fmt(t.energy)}/${fmt(t.energy_max)}`);
+    set("tapPlus", "+" + (t.x2_left > 0 ? 2 : 1));
+    set("tapToPromo", fmt(Math.max(0, t.goal - t.score)) + " МБ");
+    const bar = document.getElementById("tapEnergyBar");
+    if (bar) bar.style.width = (t.energy / t.energy_max) * 100 + "%";
+    const claim = document.getElementById("claimBtn");
+    if (claim) {
+      const can = t.score >= t.goal;
+      claim.disabled = !can;
+      claim.textContent = can ? "Забрать промокод" : `Накопи ${fmt(t.goal)} МБ`;
+    }
+    const x2 = document.getElementById("x2Label");
+    if (x2) x2.textContent = t.x2_left > 0 ? `x2 активен · ${fmt(t.x2_left)} тапов` : `Купить x2 энергию · ${S.config.x2_price} ₽`;
+    const btn = document.getElementById("tapBtn");
+    if (btn) btn.disabled = t.energy <= 0;
+  }
+
+  function onTap(e) {
+    const t = S.tap;
+    if (!t || t.energy <= 0 || locked()) return;
+    const per = t.x2_left > 0 ? 2 : 1;
+    t.score += per;
+    t.energy -= 1;
+    if (t.x2_left > 0) t.x2_left -= 1;
+    pending.taps += 1;
+    const btn = e.currentTarget;
+    btn.classList.add("pressed");
+    setTimeout(() => btn.classList.remove("pressed"), 80);
+    const pop = document.createElement("span");
+    pop.className = "pop";
+    pop.textContent = "+" + per;
+    pop.style.left = 30 + Math.random() * 40 + "%";
+    pop.setAttribute("aria-hidden", "true");
+    btn.appendChild(pop);
+    setTimeout(() => pop.remove(), 700);
+    haptic("light");
+    updateTapDom();
+    if (!pending.timer) pending.timer = setTimeout(flushTaps, 800);
+  }
+
+  async function flushTaps() {
+    clearTimeout(pending.timer);
+    pending.timer = null;
+    if (!pending.taps || pending.inflight) return;
+    const count = pending.taps;
+    pending.taps = 0;
+    pending.inflight = count;
+    try {
+      const server = await api("/api/tapper/tap", { count });
+      // поверх серверного состояния — тапы, сделанные пока шёл запрос
+      const extra = pending.taps;
+      server.score += extra * (server.x2_left > 0 ? 2 : 1);
+      server.energy = Math.max(0, server.energy - extra);
+      server.x2_left = Math.max(0, server.x2_left - extra);
+      S.tap = server;
+      updateTapDom();
+    } catch (e) {
+      if (e.code === "rate_limited") pending.taps += count;
+      else toast(e.message, true);
+    } finally {
+      pending.inflight = 0;
+      if (pending.taps) pending.timer = setTimeout(flushTaps, 800);
+    }
+  }
+
+  // --- FAQ ---
+  const FAQ = () => {
+    const c = S.config;
+    return [
+      ["Что такое «Безопасный интернет»?", "Шифрованное соединение: трафик идёт через наш сервер, провайдер и публичный Wi-Fi не видят, какие сайты вы открываете."],
+      ["Почему всё по нулям?", "Баланс, игры, тапалка и реферальная программа включаются после оформления подписки. До оплаты ничего не начисляется — так мы защищаем акции от накруток."],
+      ["Как оплатить?", "Выберите тариф, нажмите «Оформить» и отправьте донат через DonationAlerts на указанную сумму. В сообщение к донату вставьте код платежа (TX-…). Подписка включится автоматически в течение минуты."],
+      ["Я оплатил, но подписка не включилась", "Проверьте, что код в сообщении указан без ошибок и сумма не меньше нужной. Если прошло больше 10 минут — напишите в поддержку, указав код платежа."],
+      ["Зачем привязывать номер телефона?", "Один номер — один аккаунт. Это не даёт создавать фейковые аккаунты ради бонусов. Номер хранится в виде хеша."],
+      ["Как подключиться?", "После оплаты нажмите «Подключить» на главной, скопируйте ключ и вставьте его в приложение-клиент."],
+      ["Сколько устройств можно подключить?", "Зависит от тарифа: от 1 до 10. Количество меняется в разделе «Смена тарифа», цена пересчитывается сразу."],
+      ["Что делать, если ключ перестал работать?", "Сделайте перевыпуск ключа на экране подключения. Старый ключ сразу отключается."],
+      ["Как получить промокод в Texry Abuse?", `Тапайте по кругу: 1 тап — 1 МБ. За ${c.tap_goal_mb} МБ открывается промокод, он сразу добавляет трафик к подписке. Покупка x2 даёт 2 МБ за тап на ${c.x2_taps} тапов.`],
+      ["Сколько тапов доступно в день?", "5000 (на годовом тарифе — 10 000). Энергия обновляется каждые сутки."],
+      ["Что даёт игра?", `${fmt(c.game_goal)} очков — ${c.game_reward_months} месяца подписки бесплатно. Награда выдаётся один раз на аккаунт, ходы проверяются сервером.`],
+      ["Что даёт реферальная программа?", `+${c.ref_bonus_gb} ГБ за каждого друга, который оформил подписку по вашей ссылке. Самоприглашения и аккаунты с общим номером не засчитываются.`],
+    ];
+  };
+
+  screens.faq = () => `<div class="screen">${topBack()}<div class="scroll gap-14">
+    <div class="head-block"><span class="eyebrow">FAQ</span><p class="lead">Частые вопросы о безопасном интернете, оплате, ключах и промокодах.</p></div>
+    <div class="list" style="gap:10px">
+      ${FAQ().map(([q, a], i) => {
+        const open = S.faqOpen === i;
+        return `<div class="faq-item"><button class="faq-q" data-act="faq" data-arg="${i}" aria-expanded="${open}" aria-controls="faq-${i}"><span class="q">${esc(q)}</span><span class="sign" aria-hidden="true">${open ? "−" : "+"}</span></button>${open ? `<p class="faq-a" id="faq-${i}">${esc(a)}</p>` : ""}</div>`;
+      }).join("")}
+    </div>
+    <button class="row cream" data-act="support"><span class="r-text"><span class="r-title" style="font-weight:800">Не нашёл ответ?</span><span class="r-sub">Поддержка в Telegram · @${esc(S.config.support_username)}</span></span>${I.chev}</button>
+  </div></div>`;
+
+  // ---------- рендер ----------
+  let lastScreen = null;
+  function render(isNav) {
+    const scroller = $app.querySelector(".scroll");
+    const keepScroll = !isNav && lastScreen === S.screen && scroller ? scroller.scrollTop : 0;
+    const fn = screens[S.screen] || screens.home;
+    $app.innerHTML = fn();
+    if (!isNav && lastScreen === S.screen) {
+      const sc = $app.querySelector(".screen");
+      if (sc) sc.style.animation = "none";
+      const ns = $app.querySelector(".scroll");
+      if (ns) ns.scrollTop = keepScroll;
+    }
+    lastScreen = S.screen;
+    syncBackButton();
+    bindScreen();
+  }
+
+  function bindScreen() {
+    const range = document.getElementById("devRange");
+    if (range) {
+      range.addEventListener("input", () => { S.devices = Number(range.value); updatePlansDom(); });
+      range.addEventListener("change", () => haptic("select"));
+    }
+    const tapBtn = document.getElementById("tapBtn");
+    if (tapBtn) {
+      tapBtn.addEventListener("pointerdown", (e) => { e.preventDefault(); onTap(e); });
+      tapBtn.addEventListener("click", (e) => { if (e.detail === 0) onTap(e); }); // клавиатура
+    }
+  }
+
+  // ---------- загрузчики экранов ----------
+  async function loadRef() {
+    S.ref.loading = true;
+    try {
+      S.ref.data = await api("/api/referrals?range=" + S.ref.range);
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      S.ref.loading = false;
+      if (S.screen === "ref") render();
+    }
+  }
+  async function loadTap() {
+    try { S.tap = await api("/api/tapper"); if (S.screen === "abuse") render(); } catch (e) { toast(e.message, true); }
+  }
+  async function loadGame() {
+    try { S.game = await api("/api/game"); S.gameSel = Math.max(0, S.game.used.findIndex((u) => !u)); if (S.screen === "game") render(); } catch (e) { toast(e.message, true); }
+  }
+  async function loadKey() {
+    try { S.key = await api("/api/key"); if (S.screen === "key") render(); } catch (e) { toast(e.message, true); }
+  }
+
+  // ---------- оплата ----------
+  let payTimer = null;
+  function startPayPolling() {
+    stopPayPolling();
+    const tick = async () => {
+      const p = S.payment;
+      if (!p || !["pending", "underpaid"].includes(p.status) || S.screen !== "pay") return;
+      try {
+        const fresh = await api("/api/payments/" + encodeURIComponent(p.code));
+        const changed = fresh.status !== p.status;
+        S.payment = fresh;
+        if (changed) {
+          if (fresh.status === "paid") {
+            haptic("success");
+            await loadMe();
+          }
+          render();
+        }
+      } catch (_) {}
+      payTimer = setTimeout(tick, 5000);
+    };
+    payTimer = setTimeout(tick, 3000);
+  }
+  function stopPayPolling() { clearTimeout(payTimer); payTimer = null; }
+
+  async function createPayment(body) {
+    if (!S.me.user.phone_verified) {
+      S.afterPhone = body;
+      return go("phone");
+    }
+    try {
+      S.payment = await api("/api/payments", body);
+      S.me.pending_payment = S.payment;
+      go("pay", { replace: S.screen === "phone" });
+    } catch (e) {
+      if (e.code === "phone_required") {
+        S.afterPhone = body;
+        return go("phone");
+      }
+      toast(e.message, true);
+      haptic("error");
+    }
+  }
+
+  async function afterPhoneVerified() {
+    toast("Номер привязан");
+    haptic("success");
+    const next = S.afterPhone;
+    S.afterPhone = null;
+    if (next) return createPayment(next);
+    back();
+  }
+
+  function requestPhone() {
+    if (!tg || !tg.requestContact || !tg.isVersionAtLeast || !tg.isVersionAtLeast("6.9")) return phoneViaBot();
+    tg.requestContact(async (ok, res) => {
+      if (!ok) return toast("Без номера оплата недоступна", true);
+      try {
+        if (res && res.response) {
+          S.me = await api("/api/phone", { response: res.response });
+          if (S.me.user.phone_verified) return afterPhoneVerified();
+        }
+      } catch (e) {
+        if (e.status === 409 || e.code === "not_own") return toast(e.message, true);
+      }
+      // запасной путь: контакт приходит боту, ждём, пока он его сохранит
+      for (let i = 0; i < 6; i++) {
+        await new Promise((r) => setTimeout(r, 1500));
+        try {
+          await loadMe();
+          if (S.me.user.phone_verified) return afterPhoneVerified();
+        } catch (_) {}
+      }
+      toast("Не удалось подтвердить номер. Отправьте его через бота.", true);
+    });
+  }
+  function phoneViaBot() {
+    const bot = S.config.bot_username;
+    if (bot) openTg(`https://t.me/${bot}?start=phone`);
+    if (tg && tg.close) setTimeout(() => tg.close(), 300);
+  }
+
+  // ---------- действия ----------
+  const actions = {
+    back,
+    home: () => { S.history = []; go(ROOT, { replace: true }); },
+    retry: () => { S.screen = "loading"; render(); boot(); },
+    close: () => (tg && tg.close ? tg.close() : history.back()),
+    go: (arg) => {
+      if (arg === "pay" && S.me && S.me.pending_payment) S.payment = S.me.pending_payment;
+      go(arg);
+    },
+    buy: () => go("sub"),
+    faq: (arg) => { const i = Number(arg); S.faqOpen = S.faqOpen === i ? null : i; render(); },
+    support: () => openTg(`https://t.me/${S.config.support_username}`),
+    plan: (arg) => { S.plan = arg; haptic("select"); render(); },
+    "dev-step": (arg) => {
+      const max = S.config.device_prices.length;
+      S.devices = Math.min(max, Math.max(1, S.devices + Number(arg)));
+      const r = document.getElementById("devRange");
+      if (r) r.value = S.devices;
+      haptic("select");
+      updatePlansDom();
+    },
+    "devices-to-sub": () => go("sub"),
+    "pay-devices": () => createPayment({ kind: "devices", devices: S.devices }),
+    "pay-sub": () => createPayment({ kind: "subscription", plan_id: S.plan, devices: S.devices }),
+    "buy-x2": () => createPayment({ kind: "x2" }),
+    "request-phone": requestPhone,
+    "phone-bot": phoneViaBot,
+    "copy-code": async () => {
+      if (await copy(S.payment.code)) { S.copied = "code"; render(); setTimeout(() => { S.copied = null; if (S.screen === "pay") render(); }, 1600); }
+    },
+    "open-pay": async () => {
+      await copy(S.payment.code);
+      toast(`Код ${S.payment.code} скопирован — вставьте его в сообщение`);
+      openLink(S.payment.pay_url);
+    },
+    "cancel-pay": async () => {
+      try {
+        S.payment = await api(`/api/payments/${encodeURIComponent(S.payment.code)}/cancel`, {});
+        S.me.pending_payment = null;
+        S.payment = null;
+        S.history = [];
+        go(ROOT, { replace: true });
+      } catch (e) { toast(e.message, true); }
+    },
+    "ref-range": (arg) => { S.ref.range = arg; S.ref.bar = null; render(); loadRef(); },
+    "ref-bar": (arg) => { const i = Number(arg); S.ref.bar = S.ref.bar === i ? null : i; render(); },
+    "copy-ref": async () => {
+      const link = (S.ref.data && S.ref.data.link) || S.me.ref_link;
+      if (link && (await copy(link))) { S.ref.copied = true; render(); setTimeout(() => { S.ref.copied = false; if (S.screen === "ref") render(); }, 1600); }
+    },
+    "share-ref": () => {
+      const link = (S.ref.data && S.ref.data.link) || S.me.ref_link;
+      if (!link) return;
+      const text = `Безопасный интернет в Telegram — ${S.config.brand}`;
+      openTg(`https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(text)}`);
+    },
+    piece: (arg) => { S.gameSel = Number(arg); haptic("select"); render(); },
+    cell: async (arg) => {
+      const g = S.game;
+      if (!g || g.over || S.gameBusy) return;
+      const i = Number(arg), r = Math.floor(i / 8), c = i % 8;
+      const piece = g.tray[S.gameSel];
+      if (!piece || g.used[S.gameSel] || !canPlace(g.board, piece, r, c)) return haptic("warning");
+      S.gameBusy = true;
+      try {
+        const res = await api("/api/game/move", { piece: S.gameSel, r, c });
+        const cleared = res.score - g.score > piece.length * 5;
+        S.game = res;
+        if (res.used[S.gameSel]) S.gameSel = Math.max(0, res.used.findIndex((u) => !u));
+        haptic(res.rewarded_now ? "success" : cleared ? "medium" : "light");
+        if (res.rewarded_now) { toast(`Промокод: ${S.config.game_reward_months} месяца начислены`); loadMe(); }
+      } catch (e) {
+        if (e.code !== "too_fast") toast(e.message, true);
+        if (e.status === 409) loadGame();
+      } finally {
+        S.gameBusy = false;
+        render();
+      }
+    },
+    "game-reset": async () => {
+      try { S.game = await api("/api/game/reset", {}); S.gameSel = 0; render(); } catch (e) { toast(e.message, true); }
+    },
+    claim: async () => {
+      await flushTaps();
+      try {
+        const res = await api("/api/tapper/claim", {});
+        S.tap = res;
+        if (res.promo) { toast(`Промокод ${res.promo.code}: +${res.promo.mb} МБ к трафику`); haptic("success"); loadMe(); }
+        render();
+      } catch (e) { toast(e.message, true); }
+    },
+    "copy-key": async () => {
+      const k = S.key && (S.key.key || S.key.sub_url);
+      if (k && (await copy(k))) { S.copied = "key"; render(); setTimeout(() => { S.copied = null; if (S.screen === "key") render(); }, 1600); }
+    },
+    reissue: async () => {
+      try { S.key = await api("/api/key/reissue", {}); toast("Ключ перевыпущен"); render(); } catch (e) { toast(e.message, true); }
+    },
+    soon: () => toast("Скоро"),
+  };
+
+  $app.addEventListener("click", (e) => {
+    const el = e.target.closest("[data-act]");
+    if (!el || el.disabled || !$app.contains(el)) return;
+    const fn = actions[el.dataset.act];
+    if (fn) fn(el.dataset.arg, el);
+  });
+
+  // экспорт для отладки
+  window.__texry = { S, render, go };
+  boot();
+})();

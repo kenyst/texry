@@ -1,0 +1,54 @@
+"""Локальные демо-данные для вёрстки (DEV_MODE=1). Открывать: http://localhost:8080/app/?dev=<id>
+
+  101 — новый пользователь: всё по нулям и заблокировано
+  102 — активная подписка (6 мес, 2 устройства), рефералы, тапалка, игра
+  103 — номер привязан, ждёт оплату
+"""
+import asyncio
+import json
+from datetime import timedelta
+
+from app import db
+from app.config import get_settings
+from app.models import Payment, Referral, TapState, User
+from app.services import blockgame
+from app.services.subscriptions import extend
+from app.services.users import bind_phone, get_or_create_user
+
+
+async def main():
+    st = get_settings()
+    db.init_engine(st.database_url)
+    await db.create_all()
+    async with db.session_scope() as s:
+        await get_or_create_user(s, {"id": 101, "first_name": "Новый", "username": "newbie"}, st)
+
+        u, _ = await get_or_create_user(s, {"id": 102, "first_name": "Алексей", "last_name": "Козлов", "username": "alexk"}, st)
+        await bind_phone(s, u, "+79990000102", st)
+        sub = await extend(s, u, st, plan_id="m6", months=6, devices=2, bonus_gb=30)
+        sub.traffic_used_mb = 196 * 1024
+        sub.expires_at = db.utcnow() + timedelta(days=24)
+        for i, (name, status, days) in enumerate([("mikhail_v", "credited", 0), ("dariaS", "credited", 1), ("kirill_dev", "joined", 3), ("anna", "hold", 5)]):
+            f, _ = await get_or_create_user(s, {"id": 2000 + i, "first_name": name, "username": name}, st)
+            await s.flush()
+            s.add(Referral(referrer_id=102, invitee_id=f.id, status=status, bonus_mb=5120 if status == "credited" else 0,
+                           created_at=db.utcnow() - timedelta(days=days, hours=2)))
+        s.add(TapState(user_id=102, day="", energy_used=1320, score=320, total_taps=1320, x2_left=0, promos=2, tokens=36, last_batch_at=0))
+        gs = await blockgame.load(s, 102)
+        state = blockgame.GameState.from_json(gs.state)
+        for i in [0, 1, 2, 8, 9, 16, 40, 41, 48, 49, 50, 56, 57, 58, 59, 60]:
+            state.board[i] = True
+        state.score = 42_180
+        gs.state = state.to_json()
+
+        p, _ = await get_or_create_user(s, {"id": 103, "first_name": "Мария", "username": "masha"}, st)
+        await bind_phone(s, p, "+79990000103", st)
+        await s.flush()
+        s.add(Payment(user_id=103, code="7K2M9Q", kind="subscription", plan_id="m12", months=12, devices=1, amount=1290,
+                      status="pending", created_at=db.utcnow(), expires_at=db.utcnow() + timedelta(minutes=60)))
+    await db.dispose()
+    print(json.dumps({"ok": True}))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
