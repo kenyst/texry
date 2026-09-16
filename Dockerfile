@@ -8,7 +8,6 @@ RUN pip install -r requirements.txt
 
 COPY app ./app
 COPY webapp ./webapp
-COPY scripts ./scripts
 
 RUN useradd -m texry && mkdir -p /srv/data && chown -R texry /srv/data
 USER texry
