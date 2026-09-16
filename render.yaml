@@ -1,0 +1,20 @@
+# Бесплатный тестовый запуск на Render (Blueprint): New → Blueprint → выбрать этот репозиторий.
+# Render спросит значения для BOT_TOKEN, ADMIN_IDS и DATABASE_URL; SECRET_KEY сгенерирует сам.
+services:
+  - type: web
+    name: texry-bot
+    runtime: docker
+    plan: free
+    region: frankfurt
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_MODE
+        value: webhook
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
